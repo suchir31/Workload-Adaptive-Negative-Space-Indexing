@@ -1,0 +1,19 @@
+name: Python and C++
+on: [push, pull_request]
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -e '.[test]' cmake pybind11
+      - run: python -m pytest -q
+      - run: python -m examples.demo
+      - run: cmake -S . -B build/cmake -DPython_EXECUTABLE=$(which python)
+      - run: cmake --build build/cmake --parallel 2
+      - run: ctest --test-dir build/cmake --output-on-failure

@@ -1,24 +1,42 @@
-# CertSkip
+# CertSkip — Python / C++20
 
-A working prototype of workload-adaptive, exactly verified empty-region
-certificates for immutable Parquet files. Row groups are the pruning unit.
-PyArrow reads only the selected row groups, then Apache DataFusion executes the
-query predicate over their Arrow batches.
+Workload-adaptive, exactly verified empty-region certificates for immutable
+Parquet files. C++ verifies absent regions, selects certificates under a byte
+budget, checks containment, and reads selected row groups with Apache Arrow C++.
+Python coordinates workloads and file versions. DuckDB executes the query over
+the selected Arrow data. DataFusion is no longer a dependency.
 
-## Run
+This checkout previously contained a Python/DataFusion prototype, not Rust source.
+The v0.2 migration follows the supplied C++/Python beginner guide; see
+[PROJECT_PLAN.md](PROJECT_PLAN.md) for the implementation plan and scope.
 
-Python 3.9 or later:
+## Build and run
+
+Use Python 3.9–3.13, a C++20 compiler, and macOS 12+ or Linux. The native reader
+uses POSIX file descriptors; Windows is not currently supported. PyArrow 19.0.1
+is pinned for matching build/runtime Arrow ABIs. No separate Arrow installation
+is necessary: its wheel supplies the headers and shared libraries.
 
 ```sh
 python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -e '.[test]'
 .venv/bin/python -m pytest -q
 .venv/bin/python -m examples.demo
 ```
 
-The demo finds a cross-column gap: `India` and `Laptop` both occur in the first
-row group, but never together. It skips that group, reads the second group, and
-returns the same matching row as an unpruned query.
+For CMake development and standalone C++ tests:
+
+```sh
+.venv/bin/python -m pip install cmake pybind11
+.venv/bin/cmake -S . -B build/cmake -DPython_EXECUTABLE="$PWD/.venv/bin/python"
+.venv/bin/cmake --build build/cmake --parallel 2
+.venv/bin/ctest --test-dir build/cmake --output-on-failure
+```
+
+CMake places the extension in `certskip/`. Editable installation compiles it too;
+rebuild after C++ edits. CTest uses a small dependency-free native test executable;
+Python integration tests use pytest. CI runs both on Linux and macOS.
 
 ## Use
 
@@ -37,91 +55,101 @@ result = execute(files, query, index=index, workload=workload)
 print(result.table.to_pylist())
 print(result.stats)
 
-# Adapt to observations collected by execute(); publish the completed new index.
+# Offline adaptation: publish a completed replacement between workload epochs.
+# The guide suggests 1,000 queries per epoch; refresh remains explicit.
 index = build_index(files, workload, memory_budget=10 * 1024 * 1024)
 ```
 
-A numeric region can use `Interval(20, 30)`,
-`Interval(20, 30, lower_closed=False)`, or `Interval(20, None)`.
-`Region()` matches all rows. Predicates are conjunctions with one interval per
-column. Equality supports Arrow integer, UTF-8 string, and boolean columns;
-ranges support integers. NULL values do not satisfy comparisons. Literal types
-must match the column, and integer overflow is rejected. Floats, decimals,
-timestamps, OR, casts, and arbitrary SQL are deliberately outside this first
-predicate language; callers must use their ordinary query engine for those
-queries. Unsupported predicates raise an error before any pruning.
+The demo identifies a cross-column gap: `India` and `Laptop` occur separately in
+one group but never together. That group is skipped before reading its data.
+
+`Interval(20, 30)` represents an inclusive integer range. Open and one-sided
+bounds, integer/string/boolean equality, and NULL comparison semantics from the
+previous API are preserved. `Region()` matches all rows. Predicates are AND
+conjunctions with one interval per column. Literals must match the Arrow column
+type; integer overflow is rejected. Floats, timestamps, OR, casts, and arbitrary
+SQL are outside certificate inference. Use the explicit ordinary DuckDB path:
+
+```python
+from certskip import execute_sql
+result = execute_sql(files,
+    "SELECT * FROM certskip_input WHERE age = 25 OR salary > 180000")
+```
+
+`execute_sql` accepts one SELECT, bypasses certificates, and returns an Arrow
+Table. It is also the native DuckDB comparison path, separate from the adapter.
+The typed `execute` API rejects unsupported predicates before pruning.
 
 ## Components
 
-- **Workload analyzer:** counts observed typed predicates. Explicit frequencies
-  support imported workloads. A query can record itself after successful execution.
-- **Candidate generator:** proposes the most frequent distinct query regions,
-  bounded by `candidate_limit` (default 1,000). It never enumerates missing
-  Cartesian products. Wider regions can be seeded as workload predicates.
-- **Verifier:** scans candidate columns in batches for each row group. A single
-  matching row rejects a candidate; only exhaustive absence creates a certificate.
-  All candidates share this verification pass. NULLs follow the query language's
-  SQL comparison semantics.
-- **Selector:** greedily chooses highest marginal frequency-weighted compressed
-  bytes saved per certificate byte. It counts each `(file, row group, query)`
-  benefit once. Integer min/max and all-null metadata reduce the estimated
-  benefit of proofs ordinary statistics already provide. Selection is a heuristic,
-  not an exact knapsack optimizer.
-- **Index:** packs selected certificates into bytes. Each record includes the
-  canonical path, file-version token, row-group ID, typed empty region, and cost
-  estimate. `memory_bytes` includes the resident index object and packed payload;
-  the configured budget is enforced against that amount. Workload counters,
-  build-time candidate buffers, temporary decoding, and query data are separate.
-- **Execution:** checks `query implies certificate region` before calling
-  `read_row_group`. Missing, stale, or inapplicable certificates cause a read.
-  The exact same `Region` generates the DataFusion SQL filter, avoiding a
-  potentially unsound separate caller-supplied SQL/pruning-predicate pair.
+- `certskip/predicates.py`: typed query validation and SQL generation.
+- `certskip/engine.py`: workload counters, bounded frequent candidate generation,
+  file snapshots, ordinary integer min/max/all-null pruning, benefit estimates,
+  packed index storage, and DuckDB integration.
+- `cpp/model.hpp`, `pruning.cpp`: typed C++ intervals/regions and containment,
+  including exact signed/unsigned 64-bit comparisons.
+- `cpp/certificate.cpp`: exact verification against Arrow columns; a matching row
+  rejects a candidate. NULL comparisons never match.
+- `cpp/selector.cpp`: greedy marginal frequency-weighted compressed bytes saved
+  per stored certificate byte. Each `(file, group, query)` benefit counts once.
+- `cpp/parquet_reader.cpp`: selective Arrow C++ reads from a duplicate of the
+  open snapshot descriptor. Verification projects only candidate columns.
+- `cpp/bindings.cpp`: pybind11 bridge and Arrow table transfer to Python.
 
-## File lifecycle and correctness
+Candidates are bounded by `candidate_limit` (default 1,000), not a Cartesian
+product of missing combinations. Wider regions can be seeded as workload queries.
+Verification shares each projected row-group read across candidates, then checks
+each candidate against its rows. Selection excludes benefits already obtained by
+ordinary integer min/max or all-null pruning.
+
+## Correctness and lifecycle
 
 The invariant is `block ∩ certified_region = empty` and
-`query_region ⊆ certified_region`. Therefore skipped blocks contain no query
-matches. A union of several certificates is not used to infer coverage.
+`query_region ⊆ certified_region`. One complete certificate must cover the query;
+a union of partial proofs is not used. Missing/stale/inapplicable certificates
+fall back to ordinary reading. Statistics pruning runs first in both baseline
+and certificate-enabled execution.
 
 Version tokens contain filesystem device, inode, size, nanosecond modification
-time, and nanosecond change time. Build and execution each keep an open file
-descriptor and compare its token before and after reading. Atomic replacement
-cannot switch an already-open reader; subsequent queries see the replacement's
-new token and ignore old certificates. An observed in-place mutation raises
-`FileChangedError`, discarding the operation's result.
+and change times. Build and execution hold open descriptors and compare tokens
+before/after reads. Atomic replacement cannot switch an already-open native
+reader; later operations ignore old certificates. An observed in-place mutation
+raises `FileChangedError`, discarding the operation's result.
 
-This contract assumes immutable local files replaced atomically on a filesystem
-with reliable identity and timestamps. It is not a content hash, remote object
-versioning scheme, or a transaction protocol for concurrent in-place writers.
-Multiple files are opened independently, so cross-file transactional snapshots
-are not provided. Rebuild after replacement to restore pruning benefits.
+This assumes immutable local files, atomically replaced on a filesystem with
+reliable timestamps. Tokens are not content hashes or remote-object versions;
+concurrent in-place writers and cross-file transactional snapshots are unsupported.
+`execute_sql` uses DuckDB's ordinary file access rather than this snapshot wrapper.
 
-Certificates are created in-process through verification. There is no API to
-load untrusted or hand-written certificate files; mutating private index state
-invalidates the correctness contract.
+The index stores packed verified records in process. `memory_bytes` includes the
+resident index object and payload. Build buffers, decoded records, query data,
+and workload counters are separate. There is no untrusted certificate-loading
+API. Modifying private index state invalidates the correctness contract.
 
-## Scope and measurements
+## Validation and limits
 
-This is a Python scan adapter, not a native DataFusion optimizer rule or Rust
-TableProvider. Surviving row groups are materialized in memory before DataFusion
-filters them. The API returns all columns for a typed selection query; it does
-not provide arbitrary SQL aggregation or join planning. Files in one query must
-have matching schemas.
+Tests compare native containment with Python semantics and pruned answers with
+both the certificate-disabled Arrow/DuckDB path and Python row evaluation. They
+cover NULLs, integer extremes, duplicate preservation, overlapping benefits,
+index budgets, file replacement, nested-column projection, ordinary pruning,
+and skipping before native data reads.
 
-The packed index currently performs a linear certificate lookup per row group.
-Candidate verification and greedy selection favor clarity over large-workload
-scalability. Selection estimates omit lookup CPU costs and do not model all
-Parquet bloom-filter, page-index, string-statistics, or projection savings.
-`estimated_bytes_skipped` sums compressed column-chunk sizes; it is not measured
-filesystem I/O and excludes footer reads. The unpruned reference uses the same
-adapter with certificate pruning disabled, not DataFusion's native Parquet scan.
+`QueryStats` reports groups read/skipped, separates ordinary and certificate skips,
+and reports **estimated** compressed bytes read/skipped. These are column-chunk
+estimates, not measured filesystem I/O; footer reads are excluded. The adapter
+materializes surviving groups before DuckDB filters them. Verification holds one
+projected row group in memory. Index lookup is linear and selection is greedy;
+this is a correctness-oriented prototype, not a native DuckDB optimizer extension.
 
-Tests cover exact cross-column absence, containment boundaries, NULLs, SQL
-escaping, budget enforcement, overlapping benefits, file invalidation, empty
-files, and randomized comparison with both unpruned DataFusion and Python
-predicate evaluation.
+Run a small repeated comparison (checks duplicates and records build/refresh cost):
 
-The integration uses DataFusion's documented
-[record-batch registration API](https://datafusion.apache.org/python/autoapi/datafusion/context/index.html).
-Dependencies target DataFusion 43 and PyArrow 18–19 for the Python 3.9 environment;
-the implementation was tested with DataFusion 43.1.0 and PyArrow 19.0.1.
+```sh
+.venv/bin/python -m examples.benchmark --repeats 5
+```
+
+This compares ordinary pruning (B0), a fixed trained index (B1), and an index
+refreshed for a workload shift (B3), plus native DuckDB separately. It is a smoke
+benchmark, not a full research evaluation: frequency-only B2, budget sweeps,
+independent datasets and plotting remain future experiment work. No speedup or
+novelty claim is made. The migration was locally tested with Python 3.9,
+PyArrow 19.0.1, DuckDB 1.4.5 and pybind11 2.13.6 on macOS arm64.

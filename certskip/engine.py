@@ -1,4 +1,4 @@
-"""Immutable-file certificate lifecycle and a DataFusion execution adapter."""
+"""Immutable-file certificate lifecycle and an Arrow C++ / DuckDB execution adapter."""
 import json
 import os
 import sys
@@ -9,7 +9,9 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from datafusion import SessionContext
+import duckdb
+
+from . import _native
 
 from .predicates import Region
 
@@ -29,7 +31,8 @@ def _snapshot(path):
     with open(path, "rb") as handle:
         version = _version(handle)
         parquet = pq.ParquetFile(handle)
-        yield parquet, version
+        reader = _native.Reader(handle.fileno())
+        yield parquet, version, reader
         if _version(handle) != version:
             raise FileChangedError("File changed during operation; discard result and retry")
 
@@ -103,7 +106,7 @@ class CertificateIndex:
 
     def prunes(self, path, version, row_group, query):
         return any(c.path == path and c.version == version and
-                   c.row_group == row_group and c.region.covers(query)
+                   c.row_group == row_group and _native.covers(c.region.to_dict(), query.to_dict())
                    for c in self.certificates())
 
 
@@ -115,11 +118,14 @@ def _compressed_bytes(metadata):
 def _stats_exclude(metadata, query):
     """Conservative cost baseline for integer min/max and all-null columns.
 
-    This affects selection value only; it is never used as an emptiness proof.
+    Used by both ordinary pruning and the selector savings baseline.
     """
     columns = {metadata.column(i).path_in_schema: metadata.column(i)
                for i in range(metadata.num_columns)}
+    paths = [metadata.column(i).path_in_schema for i in range(metadata.num_columns)]
     for name, bound in query.terms:
+        if paths.count(name) != 1:
+            continue  # Dotted flat names can collide with nested leaf paths.
         column = columns.get(name)
         stats = column.statistics if column is not None else None
         if stats is None:
@@ -150,23 +156,16 @@ def build_index(paths, workload, memory_budget=10 * 1024 * 1024, candidate_limit
     candidates = workload.candidates(candidate_limit)
     verified = []
     coverage = []
+    benefit_ids = {}
     for path in sorted({str(Path(p).resolve()) for p in paths}):
-        with _snapshot(path) as (parquet, version):
+        with _snapshot(path) as (parquet, version, reader):
             for query, _ in queries:
                 query.validate(parquet.schema_arrow)
-            columns = sorted({name for candidate in candidates for name, _ in candidate.terms})
+            native_candidates = [candidate.to_dict() for candidate in candidates]
             for group_id in range(parquet.num_row_groups):
                 metadata = parquet.metadata.row_group(group_id)
-                # An empty conjunction is TRUE; only an empty block can certify it.
-                remaining = set(candidates)
-                if columns:
-                    for batch in parquet.iter_batches(row_groups=[group_id], columns=columns):
-                        for row in batch.to_pylist():
-                            remaining.difference_update(c for c in tuple(remaining) if c.matches(row))
-                        if not remaining:
-                            break
-                elif metadata.num_rows:
-                    remaining.clear()
+                verified_empty = reader.verify(group_id, native_candidates)
+                remaining = {candidate for candidate, empty in zip(candidates, verified_empty) if empty}
                 for candidate in candidates:
                     if candidate not in remaining:
                         continue
@@ -175,31 +174,17 @@ def build_index(paths, workload, memory_budget=10 * 1024 * 1024, candidate_limit
                     benefits = {
                         (path, group_id, q): frequency * certificate.estimated_bytes
                         for q, frequency in queries
-                        if candidate.covers(q) and not _stats_exclude(metadata, q)
+                        if _native.covers(candidate.to_dict(), q.to_dict()) and not _stats_exclude(metadata, q)
                     }
                     verified.append(certificate.encode())
-                    coverage.append(benefits)
-    # Each (block, query) benefit may be claimed once, even with overlapping regions.
-    covered = set()
-    available = set(range(len(verified)))
-    selected = []
-    used = index.memory_bytes
-    while available:
-        best, best_score = None, 0
-        for i in sorted(available):
-            if used + len(verified[i]) > memory_budget:
-                continue
-            gain = sum(value for key, value in coverage[i].items() if key not in covered)
-            score = gain / len(verified[i])
-            if score > best_score:
-                best, best_score = i, score
-        if best is None:
-            break
-        selected.append(verified[best])
-        used += len(verified[best])
-        covered.update(coverage[best])
-        available.remove(best)
-    index._payload = b"".join(selected)
+                    coverage.append({
+                        benefit_ids.setdefault(key, len(benefit_ids)): value
+                        for key, value in benefits.items()
+                    })
+    # Native selector counts each (block, query) benefit once across overlapping proofs.
+    selected = _native.select([len(record) for record in verified], coverage,
+                              memory_budget - index.memory_bytes)
+    index._payload = b"".join(verified[i] for i in selected)
     return index
 
 
@@ -208,6 +193,9 @@ class QueryStats:
     row_groups_read: int
     row_groups_skipped: int
     estimated_bytes_skipped: int
+    row_groups_skipped_by_statistics: int = 0
+    row_groups_skipped_by_certificates: int = 0
+    estimated_bytes_read: int = 0
 
 
 @dataclass(frozen=True)
@@ -216,39 +204,66 @@ class QueryResult:
     stats: QueryStats
 
 
+def _read_group(reader, group_id):
+    return reader.read_row_group(group_id)
+
+
 def execute(paths, query: Region, index=None, workload=None):
-    """Prune before reading row-group data, then run the exact predicate in DataFusion.
+    """Prune before reading row-group data, then run the exact predicate in DuckDB.
 
     The same typed Region drives containment and the SQL filter. Arbitrary SQL is
     intentionally not accepted as a separate filter that could disagree with it.
     """
     tables = []
     schema = None
-    read = skipped = saved = 0
+    read = skipped = saved = stats_skipped = cert_skipped = bytes_read = 0
     for path in sorted({str(Path(p).resolve()) for p in paths}):
-        with _snapshot(path) as (parquet, version):
+        with _snapshot(path) as (parquet, version, reader):
             query.validate(parquet.schema_arrow)
             if schema is None:
                 schema = parquet.schema_arrow
             elif not schema.equals(parquet.schema_arrow):
                 raise ValueError("All files must have the same Arrow schema")
             for group_id in range(parquet.num_row_groups):
-                if index is not None and index.prunes(path, version, group_id, query):
+                metadata = parquet.metadata.row_group(group_id)
+                ordinary_skip = _stats_exclude(metadata, query)
+                certificate_skip = not ordinary_skip and index is not None and index.prunes(
+                    path, version, group_id, query)
+                if ordinary_skip or certificate_skip:
                     skipped += 1
-                    saved += _compressed_bytes(parquet.metadata.row_group(group_id))
+                    stats_skipped += int(ordinary_skip)
+                    cert_skipped += int(bool(certificate_skip))
+                    saved += _compressed_bytes(metadata)
                 else:
-                    tables.append(parquet.read_row_group(group_id))
+                    tables.append(_read_group(reader, group_id))
                     read += 1
+                    bytes_read += _compressed_bytes(metadata)
     if schema is None:
         raise ValueError("At least one Parquet file is required")
     table = pa.concat_tables(tables) if tables else pa.Table.from_batches([], schema=schema)
-    context = SessionContext()
-    # Explicit empty batch retains the schema even if all row groups were skipped.
-    batches = table.to_batches() or [pa.RecordBatch.from_arrays(
-        [pa.array([], type=field.type) for field in schema], schema=schema)]
-    context.register_record_batches("certskip_input", [batches])
-    output = context.sql("SELECT * FROM certskip_input WHERE " + query.sql()).collect()
-    result = pa.Table.from_batches(output) if output else pa.Table.from_batches([], schema=schema)
+    with duckdb.connect() as connection:
+        connection.register("certskip_input", table)
+        result = connection.execute("SELECT * FROM certskip_input WHERE " + query.sql()).fetch_arrow_table()
+    # DuckDB can normalize Arrow metadata/nullability; retain the source contract.
+    result = result.cast(schema)
     if workload is not None:
         workload.observe(query)
-    return QueryResult(result, QueryStats(read, skipped, saved))
+    return QueryResult(result, QueryStats(read, skipped, saved, stats_skipped,
+                                         cert_skipped, bytes_read))
+
+
+def execute_sql(paths, sql):
+    """Run arbitrary read-only SQL against `certskip_input` using native DuckDB.
+
+    This is the explicit fallback/reference for predicates outside Region's scope.
+    It does not use certificates and does not report adapter row-group counters.
+    """
+    files = sorted({str(Path(p).resolve()) for p in paths})
+    if not files:
+        raise ValueError("At least one Parquet file is required")
+    with duckdb.connect() as connection:
+        statements = connection.extract_statements(sql)
+        if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
+            raise ValueError("Expected a single SELECT statement")
+        connection.read_parquet(files).create_view("certskip_input")
+        return connection.execute(sql).fetch_arrow_table()

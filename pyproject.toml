@@ -1,13 +1,13 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=61", "wheel", "pybind11>=2.13,<3", "pyarrow==19.0.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "certskip"
-version = "0.1.0"
+version = "0.2.0"
 description = "Verified workload-adaptive empty-region certificates for Parquet"
 requires-python = ">=3.9"
-dependencies = ["datafusion>=43,<44", "pyarrow>=18,<20"]
+dependencies = ["duckdb>=1.1,<2", "pyarrow==19.0.1"]
 
 [project.optional-dependencies]
 test = ["pytest>=8,<9"]

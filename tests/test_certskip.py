@@ -202,13 +202,14 @@ def test_skip_happens_before_row_group_read(dataset, monkeypatch):
     w.observe(q)
     index = build_index([dataset], w)
     calls = []
-    original = pq.ParquetFile.read_row_group
+    from certskip import engine
+    original = engine._read_group
 
     def tracked(self, group, *args, **kwargs):
         calls.append(group)
         return original(self, group, *args, **kwargs)
 
-    monkeypatch.setattr(pq.ParquetFile, "read_row_group", tracked)
+    monkeypatch.setattr(engine, "_read_group", tracked)
     execute([dataset], q, index)
     assert calls == [1]
 
