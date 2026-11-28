@@ -45,5 +45,5 @@ inline bool matches(const Interval& i, const Value& v) {
 bool covers(const Region& certificate, const Region& query);
 std::vector<size_t> select(const std::vector<size_t>& costs,
                           const std::vector<std::map<size_t, double>>& benefits,
-                          size_t budget);
+                          size_t budget, bool account_overlap = true);
 }

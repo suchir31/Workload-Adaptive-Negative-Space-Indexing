@@ -39,7 +39,8 @@ static Region region(py::dict input) {
 PYBIND11_MODULE(_native, m) {
     if (arrow::py::import_pyarrow() < 0) throw py::error_already_set();
     m.def("covers", [](py::dict outer, py::dict inner) { return covers(region(outer), region(inner)); });
-    m.def("select", &certskip::select);
+    m.def("select", &certskip::select, py::arg("costs"), py::arg("benefits"),
+          py::arg("budget"), py::arg("account_overlap") = true);
     py::class_<Reader>(m, "Reader")
         .def(py::init<int>())
         .def("read_row_group", [](Reader& reader, int group) {
@@ -49,10 +50,10 @@ PYBIND11_MODULE(_native, m) {
             if (!wrapped) throw py::error_already_set();
             return py::reinterpret_steal<py::object>(wrapped);
         })
-        .def("verify", [](Reader& reader, int group, const std::vector<py::dict>& inputs) {
+        .def("verify", [](Reader& reader, int group, const std::vector<py::dict>& inputs, int64_t batch_size) {
             std::vector<Region> regions;
             for (const auto& input : inputs) regions.push_back(region(input));
             py::gil_scoped_release release;
-            return reader.verify(group, regions);
-        });
+            return reader.verify(group, regions, batch_size);
+        }, py::arg("group"), py::arg("regions"), py::arg("batch_size") = 65536);
 }

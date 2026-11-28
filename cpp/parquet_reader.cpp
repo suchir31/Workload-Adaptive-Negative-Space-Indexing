@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <parquet/file_reader.h>
 #include <set>
+#include <algorithm>
 namespace certskip {
 Reader::Reader(int fd) {
     int owned = dup(fd);
@@ -12,11 +13,16 @@ Reader::Reader(int fd) {
     reader_ = take(parquet::arrow::OpenFile(file_, arrow::default_memory_pool()));
 }
 std::shared_ptr<arrow::Table> Reader::read(int group) {
+    if (group < 0 || group >= reader_->num_row_groups())
+        throw std::invalid_argument("Invalid row group");
     std::shared_ptr<arrow::Table> table;
     check(reader_->ReadRowGroup(group, &table));
     return table;
 }
-std::vector<bool> Reader::verify(int group, const std::vector<Region>& regions) {
+std::vector<bool> Reader::verify(int group, const std::vector<Region>& regions, int64_t batch_size) {
+    if (batch_size <= 0) throw std::invalid_argument("Batch size must be positive");
+    if (group < 0 || group >= reader_->num_row_groups())
+        throw std::invalid_argument("Invalid row group");
     if (regions.empty()) return {};
     std::shared_ptr<arrow::Schema> schema;
     check(reader_->GetSchema(&schema));
@@ -34,8 +40,23 @@ std::vector<bool> Reader::verify(int group, const std::vector<Region>& regions) 
         bool empty = reader_->parquet_reader()->metadata()->RowGroup(group)->num_rows() == 0;
         return std::vector<bool>(regions.size(), empty);
     }
-    std::shared_ptr<arrow::Table> table;
-    check(reader_->ReadRowGroup(group, std::vector<int>(indices.begin(), indices.end()), &table));
-    return verify_table(*table, regions);
+    reader_->set_batch_size(batch_size);
+    auto batches = take(reader_->GetRecordBatchReader(
+        {group}, std::vector<int>(indices.begin(), indices.end())));
+    std::vector<bool> empty(regions.size(), true);
+    while (true) {
+        auto batch = take(batches->Next());
+        if (!batch) break;
+        std::vector<Region> pending;
+        std::vector<size_t> ids;
+        for (size_t i = 0; i < regions.size(); ++i) if (empty[i]) {
+            pending.push_back(regions[i]);
+            ids.push_back(i);
+        }
+        auto absent = verify_batch(*batch, pending);
+        for (size_t i = 0; i < ids.size(); ++i) empty[ids[i]] = absent[i];
+        if (std::none_of(empty.begin(), empty.end(), [](bool v) { return v; })) break;
+    }
+    return empty;
 }
 }

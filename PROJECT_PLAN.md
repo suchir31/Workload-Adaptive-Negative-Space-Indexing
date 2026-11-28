@@ -1,43 +1,64 @@
-# CertSkip v0.2 — Python / C++
+# CertSkip v0.3 — complete local Python/C++ system
 
-The beginner guide is the design reference for this revision. This checkout
-previously implemented a Python/DataFusion prototype, not a Rust crate.
+The supplied beginner guide defines the local-file research-system scope. The
+previous v0.2 migration replaced Python/DataFusion with C++20/Arrow/DuckDB;
+v0.3 completes the operational and experimental workflows.
 
-## Architecture and interfaces
+## Implemented
 
-- Python owns the public `Interval`, `Region`, `Workload`, `build_index`, and
-  `execute` APIs, workload collection, file lifecycle, and packed certificates.
-- C++20 owns typed region containment, exact Arrow-table verification, greedy
-  marginal-benefit selection, and selective Arrow C++ Parquet row-group reads.
-- pybind11 connects Python to C++. PyArrow supplies matching Arrow headers and
-  shared libraries; DuckDB filters the selected Arrow table using SQL generated
-  from the same validated Region used for pruning.
-- A block is `(canonical path, file version, row-group number)`. A certificate
-  adds a verified region and estimated compressed size. Regions are conjunctions
-  of typed intervals. The existing integer ranges, string/boolean equalities and
-  SQL NULL semantics remain supported.
-- A native Reader duplicates the already-open snapshot descriptor. Certificate
-  verification and execution therefore read the same file version as metadata.
-- Ordinary integer min/max and all-null pruning precedes certificate checks.
-  Unsupported SQL can use `execute_sql`, a native DuckDB scan without certificates.
+- Typed integer ranges and string/boolean equalities, AND regions, SQL NULL
+  semantics, exact signed/unsigned boundaries, and ordinary SQL fallback.
+- Bounded frequent-query and merged-rectangle candidates; native projected,
+  batched verification with early rejection and direct typed-array access.
+- Native deterministic lazy greedy overlap-aware selection under a packed-index
+  byte budget; frequency-weighted selection without overlap adjustment for B2.
+- Snapshot-bound native row-group reads, conservative ordinary metadata pruning,
+  native certificate containment, and streaming Arrow-to-DuckDB execution.
+- Sliding-window workload tracking, epoch-triggered refresh, failure-atomic index
+  publication and explicit offline training through `CertSkip` sessions.
+- Atomic versioned JSON workload/index persistence. Loaded certificates must be
+  reverified; stale tokens and failed proofs never enable skipping.
+- Build/query timing, read/skip counters and explicitly estimated compressed bytes.
+- CLI for generation, inspection, training, typed/SQL querying and benchmarking.
+- B0/B1/B2/B3 plus native DuckDB evaluation on correlated/independent data, budget
+  sweeps, workload shifts, at least five repetitions and optional static plots.
+- Native tests, differential/integration tests, CLI tests and Linux/macOS CI.
 
-## Correctness and scope
+## Interfaces and ownership
 
-Every certificate requires exhaustive verification. Pruning requires one whole
-certificate region to contain the query. File identity and timestamps are checked
-before/after each operation; these are immutable-local-file version tokens, not
-content hashes. Files must be atomically replaced, not concurrently modified.
-Index budgets cover packed resident certificates; build/query buffers are separate.
-Refresh is explicit and offline, between batches of queries (suggested size 1,000).
+`Interval`, `Region`, `Workload`, `build_index`, `build_index_report`, `execute`,
+`execute_sql`, `CertSkip`, and persistence functions are public Python APIs.
+Python owns lifecycle, orchestration, workload collection, candidate proposals,
+metadata pruning and packed storage. C++ owns verification, greedy selection,
+containment and selective Arrow reads. pybind11 and matching PyArrow libraries
+bridge the languages; DuckDB executes the same validated predicate used for pruning.
 
-## Validation and measurements
+`BuildResult` separates its `index` from `BuildStats`, so reporting overhead does
+not consume index budget. `QueryResult` holds the returned Arrow table and stats.
+Refreshes fully build a replacement before assignment; failed refreshes retain
+both the prior index and pending observations. The automatic window defaults to
+5,000 successful queries, with refresh every 1,000.
 
-Build the native extension, run predicate/budget/file-lifecycle differential tests,
-and run the cross-column-gap demo. Compare certificate-disabled/enabled execution
-on the same Arrow/DuckDB path; native DuckDB is a separate reference. Benchmarks
-must check identical rows including duplicates, repeat at least five times, and
-label compressed-byte estimates. No speedup or research novelty is assumed.
+## Correctness contract and exclusions
 
-This is the implementation plan for the requested migration, not a claim of team
-review or approval. Distributed execution, live updates, arbitrary SQL certificate
-inference, and persisted untrusted certificates remain outside scope.
+Every proof establishes row-group absence; every skip requires full containment.
+Only immutable local files, atomically replaced on reliable filesystems, are
+supported. Version tokens are filesystem identity/timestamps, not content hashes.
+Index files are never trusted without scanning their proposed regions again.
+
+Index bytes exclude build buffers, metadata, workloads, query buffers and output.
+Verification batches limit decoded rows, not total process memory. Typed execution
+streams row groups but materializes its result. General SQL always uses ordinary
+DuckDB and does not learn certificates. Distributed execution, remote stores,
+concurrent in-place writers, cross-file transactions, SQL predicate inference and
+zero-I/O trusted persistence are outside this release.
+
+## Evaluation interpretation
+
+B0 uses ordinary pruning; B1 keeps initial certificates; B2 and B3 refresh on the
+same supplied phase workload with and without overlap accounting. All operate
+under identical configured budgets. Native DuckDB is a separate reference.
+Experiments validate row multisets including duplicates, warm up and shuffle
+variants, retain raw timing samples, and report refresh costs separately from
+query latency. These are offline synthetic experiments, not evidence of universal
+speedup or research novelty. Automatic session adaptation is tested separately.

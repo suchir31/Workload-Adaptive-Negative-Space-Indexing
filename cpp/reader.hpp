@@ -17,7 +17,7 @@ class Reader {
 public:
     explicit Reader(int fd);
     std::shared_ptr<arrow::Table> read(int group);
-    std::vector<bool> verify(int group, const std::vector<Region>& regions);
+    std::vector<bool> verify(int group, const std::vector<Region>& regions, int64_t batch_size = 65536);
 };
-std::vector<bool> verify_table(const arrow::Table& table, const std::vector<Region>& regions);
+std::vector<bool> verify_batch(const arrow::RecordBatch& batch, const std::vector<Region>& regions);
 }

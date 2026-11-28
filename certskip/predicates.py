@@ -15,6 +15,8 @@ class Interval:
     upper_closed: bool = True
 
     def __post_init__(self):
+        if type(self.lower_closed) is not bool or type(self.upper_closed) is not bool:
+            raise TypeError("Interval closure flags must be booleans")
         values = [v for v in (self.lower, self.upper) if v is not None]
         if not values or any(type(v) not in (int, str, bool) for v in values):
             raise ValueError("Use integer bounds or a non-null string/boolean equality")
@@ -135,4 +137,7 @@ class Region:
 
     @classmethod
     def from_dict(cls, data):
+        if not isinstance(data, dict) or any(not isinstance(name, str) or not isinstance(bound, dict)
+                                             for name, bound in data.items()):
+            raise TypeError("Region must map column names to interval objects")
         return cls(tuple((name, Interval(**bound)) for name, bound in data.items()))

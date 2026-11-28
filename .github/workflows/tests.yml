@@ -11,9 +11,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: python -m pip install -e '.[test]' cmake pybind11
+      - run: python -m pip install -e '.[test,plot]' cmake pybind11
       - run: python -m pytest -q
       - run: python -m examples.demo
       - run: cmake -S . -B build/cmake -DPython_EXECUTABLE=$(which python)
       - run: cmake --build build/cmake --parallel 2
       - run: ctest --test-dir build/cmake --output-on-failure
+      - run: certskip benchmark --repeats 5 --budgets 2048 --groups 4 --group-size 30 --output results/ci.json --plot results/ci.png
